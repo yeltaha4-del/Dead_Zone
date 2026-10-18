@@ -76,6 +76,72 @@ export function circleBlocked(x: number, z: number, r: number, cols: OBB[], boun
   return false;
 }
 
+/**
+ * Computes an obstacle avoidance steering direction.
+ * Uses center, left, and right whiskers/feelers to detect impending collisions with OBB colliders or boundaries.
+ * Populates out { x, z } and returns true if an obstacle needs to be steered around.
+ */
+export function avoidObstacles(
+  x: number,
+  z: number,
+  dirX: number,
+  dirZ: number,
+  r: number,
+  cols: OBB[],
+  bound: number,
+  out: P2,
+  lookahead = 1.6
+): boolean {
+  const len = Math.hypot(dirX, dirZ);
+  if (len < 0.001) return false;
+  const nx = dirX / len;
+  const nz = dirZ / len;
+
+  // Center feeler
+  const cx = x + nx * lookahead;
+  const cz = z + nz * lookahead;
+  const centerHit = circleBlocked(cx, cz, r + 0.1, cols, bound);
+
+  if (!centerHit) {
+    const c2x = x + nx * (lookahead * 0.5);
+    const c2z = z + nz * (lookahead * 0.5);
+    if (!circleBlocked(c2x, c2z, r + 0.05, cols, bound)) {
+      return false;
+    }
+  }
+
+  // Obstacle ahead! Probe left (+40 deg) and right (-40 deg)
+  const cos40 = 0.766;
+  const sin40 = 0.643;
+  const lx = nx * cos40 - nz * sin40;
+  const lz = nx * sin40 + nz * cos40;
+  const rx = nx * cos40 + nz * sin40;
+  const rz = -nx * sin40 + nz * cos40;
+
+  const probeDist = lookahead * 0.85;
+  const leftHit = circleBlocked(x + lx * probeDist, z + lz * probeDist, r, cols, bound);
+  const rightHit = circleBlocked(x + rx * probeDist, z + rz * probeDist, r, cols, bound);
+
+  let steerX = 0;
+  let steerZ = 0;
+
+  if (!leftHit && rightHit) {
+    steerX = lx;
+    steerZ = lz;
+  } else if (!rightHit && leftHit) {
+    steerX = rx;
+    steerZ = rz;
+  } else {
+    steerX = -nz;
+    steerZ = nx;
+  }
+
+  const sLen = Math.hypot(steerX, steerZ) || 1;
+  out.x = steerX / sLen;
+  out.z = steerZ / sLen;
+  return true;
+}
+
 export class NavGrid {
   readonly cell = 1;
   readonly n: number;

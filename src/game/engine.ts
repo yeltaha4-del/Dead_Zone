@@ -1,15 +1,32 @@
 import * as THREE from "three";
-import { EXPLOSION, LIMITS, PLAYER, PRICES, SENTRY, WEAPONS, WEAPON_ORDER, ZOMBIES, damageUpgradePrice, wavePlan, waveHpScale, waveSpeedScale, type Phase, type WeaponId, type ZombieKind } from "./config";
+import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
+import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
+import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPass.js";
+import { OutputPass } from "three/examples/jsm/postprocessing/OutputPass.js";
+import { ShaderPass } from "three/examples/jsm/postprocessing/ShaderPass.js";
+import { FXAAShader } from "three/examples/jsm/shaders/FXAAShader.js";
+import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
+import {
+  EXPLOSION, LIMITS, MAPS, MAP_ORDER, PLAYER, PRICES, SENTRY, WEAPONS, WEAPON_ORDER, ZOMBIES,
+  QUALITY_PRESETS, damageUpgradePrice, wavePlan, waveHpScale, waveSpeedScale,
+  type MapId, type Phase, type WeaponId, type ZombieKind, type QualityPreset
+} from "./config";
 import { Sfx } from "./audio";
 import { Library, buildSentry, buildViewModel, buildZombie, type ViewModel, type ZombieRig } from "./models";
-import { NavGrid, circleBlocked, resolveCircle } from "./physics";
+import { NavGrid, circleBlocked, resolveCircle, avoidObstacles, type P2 } from "./physics";
 import { HudStore, loadSaved, persist, type Settings, type HudState } from "./store";
-import { BOUND, buildWorld, type World } from "./world";
+import { BOUND, buildWorld, buildMap, type World } from "./world";
 
 interface Zombie { kind: ZombieKind; rig: ZombieRig; hp: number; maxHp: number; speed: number; vx: number; vz: number; cd: number; phase: number; hitT: number; state: "alive" | "dying"; deathT: number; fuse: number; stuckT: number; lastDist: number; noLoot: boolean }
 interface Pickup { obj: THREE.Object3D; gold: number; ammo: boolean; life: number }
 interface Sentry { root: THREE.Group; head: THREE.Group; flash: THREE.Mesh; cd: number; flashT: number }
 type Ammo = Record<WeaponId, { mag: number; reserve: number }>;
+
+const ADS_OFFSETS: Record<WeaponId, { x: number; y: number; z: number }> = {
+  pistol: { x: 0.0, y: -0.068, z: -0.36 },
+  shotgun: { x: 0.0, y: -0.055, z: -0.40 },
+  rifle: { x: 0.0, y: -0.096, z: -0.42 },
+};
 
 const PMAX = 180;
 export type BuyItem = "health" | "armor" | "ammoCurrent" | "ammoAll" | "damage" | "sentry";
@@ -17,18 +34,28 @@ export type BuyItem = "health" | "armor" | "ammoCurrent" | "ammoAll" | "damage" 
 export class Engine {
   store: HudStore;
   private renderer: THREE.WebGLRenderer;
+  private composer: EffectComposer | null = null;
+  private bloomPass: UnrealBloomPass | null = null;
+  private fxaaPass: ShaderPass | null = null;
+  private worldPass: RenderPass | null = null;
+  private viewPass: RenderPass | null = null;
+  private outputPass: OutputPass | null = null;
   private scene = new THREE.Scene();
   private camera: THREE.PerspectiveCamera;
   private vScene = new THREE.Scene();
   private vCam: THREE.PerspectiveCamera;
-  private world: World;
-  private nav: NavGrid;
+  private world!: World;
+  private nav!: NavGrid;
+  private currentMap: MapId = "city";
+  private mapBound = BOUND;
   private L = new Library();
   private sfx = new Sfx();
   private raf = 0;
   private last = performance.now();
   private keys = new Set<string>();
   private mouseDown = false;
+  private mouseRightDown = false;
+  private ads = 0;
   private triggerUsed = false;
   private locked = false;
   private fallback = false;
@@ -76,42 +103,47 @@ export class Engine {
   private best: { wave: number; score: number };
   private els: { cross?: HTMLElement | null; hit?: HTMLElement | null; vig?: HTMLElement | null } = {};
   private canvas: HTMLCanvasElement;
-  private tmp = new THREE.Vector3(); private tmp2 = new THREE.Vector3(); private p2 = { x: 0, z: 0 };
+  private tmp = new THREE.Vector3(); private tmp2 = new THREE.Vector3(); private p2 = { x: 0, z: 0 }; private avoidP2: P2 = { x: 0, z: 0 };
 
   constructor(private container: HTMLElement) {
     const saved = loadSaved();
     this.settings = saved.settings;
     this.best = saved.best;
     this.sfx.enabled = this.settings.sound;
-    const low = this.settings.quality === "low";
-    this.renderer = new THREE.WebGLRenderer({ antialias: !low, powerPreference: "high-performance" });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, low ? 1 : 1.5));
-    this.renderer.shadowMap.enabled = !low;
+    const preset = QUALITY_PRESETS[this.settings.quality] || QUALITY_PRESETS.medium;
+    this.renderer = new THREE.WebGLRenderer({ antialias: preset.fxaa || preset.shadows, powerPreference: "high-performance" });
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, preset.pixelRatioCap));
+    this.renderer.shadowMap.enabled = preset.shadows;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.4;
+    this.renderer.toneMappingExposure = 1.0;
     this.renderer.autoClear = false;
     this.canvas = this.renderer.domElement;
     container.appendChild(this.canvas);
-    const fog = new THREE.Color("#2b3546");
+
+    const fog = new THREE.Color("#222a36");
     this.scene.background = fog;
     this.scene.fog = new THREE.FogExp2(fog, 0.024);
     this.camera = new THREE.PerspectiveCamera(72, 1, 0.05, 220);
     this.camera.rotation.order = "YXZ";
     this.vCam = new THREE.PerspectiveCamera(60, 1, 0.01, 10);
     this.scene.add(this.camera);
-    this.scene.add(new THREE.HemisphereLight("#a0b1d2", "#3c414a", 1.4));
-    this.moon = new THREE.DirectionalLight("#a9bcff", 1.3);
+    this.scene.add(new THREE.HemisphereLight("#8aa0c4", "#2c313a", 1.15));
+    this.moon = new THREE.DirectionalLight("#a2b8e4", 1.25);
     this.moon.position.set(30, 60, 20);
-    this.moon.castShadow = !low;
-    this.moon.shadow.mapSize.set(2048, 2048);
+    this.moon.castShadow = preset.shadows;
+    this.moon.shadow.mapSize.set(preset.shadowMapSize, preset.shadowMapSize);
     Object.assign(this.moon.shadow.camera, { left: -70, right: 70, top: 70, bottom: -70, near: 1, far: 160 });
-    this.moon.shadow.bias = -0.0005;
+    this.moon.shadow.bias = -0.0003;
+    this.moon.shadow.normalBias = 0.02;
     this.scene.add(this.moon);
-    this.world = buildWorld(!low);
+    this.world = buildMap(this.currentMap, preset.shadows, this.settings.quality);
+    this.mapBound = this.world.bound ?? BOUND;
     this.scene.add(this.world.group);
-    this.world.lampLights.forEach((l) => (l.visible = !low));
-    this.nav = new NavGrid(this.world.colliders, BOUND);
+    this.world.lampLights.forEach((l) => (l.visible = preset.shadows));
+    this.nav = new NavGrid(this.world.colliders, this.mapBound);
+    this.setupPostProcessing();
     this.camera.add(this.flashlight, this.flashlight.target, this.muzzleLight);
     this.flashlight.position.set(0.2, -0.1, 0);
     this.flashlight.target.position.set(0, 0, -10);
@@ -159,6 +191,8 @@ export class Engine {
     document.addEventListener("mousemove", this.onMove);
     document.addEventListener("pointerlockchange", this.onLock);
     this.canvas.addEventListener("mousedown", this.onDown);
+    this.canvas.addEventListener("contextmenu", this.onContextMenu);
+    window.addEventListener("contextmenu", this.onContextMenu);
     this.raf = requestAnimationFrame(this.loop);
     (window as unknown as { __game: Engine }).__game = this;
   }
@@ -172,6 +206,7 @@ export class Engine {
       weapon: this.weapon, ammo: { pistol: { ...this.ammo.pistol }, shotgun: { ...this.ammo.shotgun }, rifle: { ...this.ammo.rifle } },
       reloading: this.reloadT > 0, countdown: Math.ceil(this.countdown), banner: "", bannerId: 0, notices: [], flashlight: this.flashlight.visible,
       damageLevel: this.dmgLevel, sentries: this.sentries.length, marketAfterWave: false, best: { ...this.best }, settings: { ...this.settings }, lockFallback: this.fallback,
+      map: this.currentMap,
     };
   }
   private emit(extra: Partial<ReturnType<Engine["snapshot"]>> = {}) {
@@ -190,7 +225,15 @@ export class Engine {
     this.timeouts.add(id);
   }
   private get phase() { return this.store?.get().phase ?? "menu"; }
-  private setPhase(p: Phase, extra: object = {}) { this.clearInput(); this.emit({ phase: p, ...extra }); }
+  private setPhase(p: Phase, extra: object = {}) {
+    this.clearInput();
+    this.ads = 0;
+    if (this.camera && this.camera.fov !== 72) {
+      this.camera.fov = 72;
+      this.camera.updateProjectionMatrix();
+    }
+    this.emit({ phase: p, ...extra });
+  }
   private get simulating() { return !this.disposed && (this.phase === "combat" || this.phase === "countdown") && this.locked; }
 
   // ---------- lifecycle / control ----------
@@ -202,7 +245,10 @@ export class Engine {
     for (const p of this.pickups) this.scene.remove(p.obj);
     for (const s of this.sentries) this.scene.remove(s.root);
     this.zombies = []; this.pickups = []; this.sentries = []; this.toSpawn = []; this.targetsDirty = true;
-    this.pos.set(0, 0, 8); this.vy = 0; this.hv.set(0, 0); this.yaw = 0; this.pitch = 0;
+    const spawn = this.world?.playerSpawn ?? { x: 0, z: 8 };
+    this.pos.set(spawn.x, 0, spawn.z); this.vy = 0; this.hv.set(0, 0); this.yaw = 0; this.pitch = 0;
+    this.mouseRightDown = false; this.ads = 0;
+    if (this.camera && this.camera.fov !== 72) { this.camera.fov = 72; this.camera.updateProjectionMatrix(); }
     this.grounded = true; this.fallback = false; this.recoil = 0; this.bob = 0; this.bloom = 0;
     this.hitT = 0; this.headT = 0; this.flashT = 0; this.spawnT = 0; this.navT = 0; this.emitT = 0; this.groanT = 3;
     this.resumePhase = "countdown"; this.switchT = 0; this.targets = []; this.noticeId = 0;
@@ -231,12 +277,96 @@ export class Engine {
     this.fallback = false;
     this.setPhase("paused", { lockFallback: true });
   }
-  start() {
+  start(mapId?: MapId) {
+    if (mapId && mapId !== this.currentMap) {
+      this.setMap(mapId);
+    }
     this.resetRun();
     this.wave = 1; this.countdown = 3; this.toSpawn = wavePlan(1);
     this.setPhase("countdown", { marketAfterWave: false, notices: [], banner: "", lockFallback: false });
     this.banner("DALGA 1");
     this.requestLock();
+  }
+  selectMap(id: MapId) {
+    if (this.currentMap === id && this.world) return;
+    this.setMap(id);
+  }
+  private setupPostProcessing() {
+    this.disposePostProcessing();
+    const preset = QUALITY_PRESETS[this.settings.quality] || QUALITY_PRESETS.medium;
+    if (!preset.postProcessing) return;
+    try {
+      const w = this.container?.clientWidth || (typeof window !== "undefined" ? window.innerWidth : 800) || 800;
+      const h = this.container?.clientHeight || (typeof window !== "undefined" ? window.innerHeight : 600) || 600;
+      const pr = Math.min((typeof window !== "undefined" ? window.devicePixelRatio : 1) || 1, preset.pixelRatioCap);
+
+      this.composer = new EffectComposer(this.renderer);
+      this.composer.setSize(w, h);
+
+      this.worldPass = new RenderPass(this.scene, this.camera);
+      this.composer.addPass(this.worldPass);
+
+      this.viewPass = new RenderPass(this.vScene, this.vCam);
+      this.viewPass.clear = false;
+      this.viewPass.clearDepth = true;
+      this.composer.addPass(this.viewPass);
+
+      this.outputPass = new OutputPass();
+      this.composer.addPass(this.outputPass);
+
+      if (preset.fxaa) {
+        this.fxaaPass = new ShaderPass(FXAAShader);
+        const res = this.fxaaPass.material.uniforms["resolution"];
+        if (res && res.value) res.value.set(1 / (w * pr), 1 / (h * pr));
+        this.fxaaPass.renderToScreen = true;
+        this.composer.addPass(this.fxaaPass);
+      }
+    } catch {
+      this.composer = null;
+    }
+  }
+
+  private disposePostProcessing() {
+    if (this.composer) {
+      try {
+        const passes = [...this.composer.passes];
+        for (const p of passes) {
+          if (p && typeof (p as any).dispose === "function") {
+            (p as any).dispose();
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+      this.composer = null;
+    }
+    this.worldPass = null;
+    this.viewPass = null;
+    this.bloomPass = null;
+    this.fxaaPass = null;
+    this.outputPass = null;
+  }
+
+  setMap(id: MapId) {
+    this.currentMap = id;
+    const preset = QUALITY_PRESETS[this.settings.quality] || QUALITY_PRESETS.medium;
+    if (this.world) {
+      this.scene.remove(this.world.group);
+      this.world.dispose();
+    }
+    this.world = buildMap(id, preset.shadows, this.settings.quality);
+    this.scene.add(this.world.group);
+    this.mapBound = this.world.bound ?? BOUND;
+    this.world.lampLights.forEach((l) => (l.visible = preset.shadows));
+    this.nav = new NavGrid(this.world.colliders, this.mapBound);
+    const mapDef = MAPS[id];
+    const fogCol = new THREE.Color(this.world.fogColor ?? mapDef?.fogColor ?? "#2b3546");
+    this.scene.background = fogCol;
+    this.scene.fog = new THREE.FogExp2(fogCol, this.world.fogDensity ?? mapDef?.fogDensity ?? 0.024);
+    const spawn = this.world.playerSpawn ?? { x: 0, z: 8 };
+    this.pos.set(spawn.x, 0, spawn.z);
+    this.targetsDirty = true;
+    this.emit();
   }
   resume() {
     if (this.phase !== "paused") return;
@@ -266,15 +396,39 @@ export class Engine {
   }
   toMenu() { this.resetRun(); this.setPhase("menu", { notices: [], banner: "", marketAfterWave: false, lockFallback: false }); if (document.pointerLockElement) document.exitPointerLock(); }
   updateSettings(s: Partial<Settings>) {
+    const prevQuality = this.settings.quality;
     this.settings = { ...this.settings, ...s };
     this.sfx.enabled = this.settings.sound;
-    const low = this.settings.quality === "low";
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, low ? 1 : 1.5));
-    if (this.renderer.shadowMap.enabled === low) {
-      this.renderer.shadowMap.enabled = !low; this.moon.castShadow = !low;
-      this.world.lampLights.forEach((l) => (l.visible = !low));
-      this.scene.traverse((o) => { const m = (o as THREE.Mesh).material as THREE.Material | undefined; if (m) m.needsUpdate = true; });
+    const preset = QUALITY_PRESETS[this.settings.quality] || QUALITY_PRESETS.medium;
+    if (typeof this.renderer?.setPixelRatio === "function") {
+      this.renderer.setPixelRatio(Math.min((typeof window !== "undefined" ? window.devicePixelRatio : 1) || 1, preset.pixelRatioCap));
     }
+    if (this.renderer?.shadowMap) {
+      this.renderer.shadowMap.enabled = preset.shadows;
+    }
+    if (this.moon) {
+      this.moon.castShadow = preset.shadows;
+      if (this.moon.shadow?.mapSize) {
+        this.moon.shadow.mapSize.set(preset.shadowMapSize, preset.shadowMapSize);
+      }
+      if (this.moon.shadow?.map) {
+        this.moon.shadow.map.dispose();
+        (this.moon.shadow as any).map = null;
+      }
+    }
+    if (this.world?.lampLights) {
+      this.world.lampLights.forEach((l) => (l.visible = preset.shadows));
+    }
+
+    if (prevQuality !== this.settings.quality) {
+      this.scene.environment = null;
+      this.setupPostProcessing();
+      this.scene.traverse((o) => {
+        const m = (o as THREE.Mesh).material as THREE.Material | undefined;
+        if (m) m.needsUpdate = true;
+      });
+    }
+
     this.resize();
     persist(this.best, this.settings);
     this.emit();
@@ -318,7 +472,7 @@ export class Engine {
   }
 
   // ---------- input ----------
-  private clearInput = () => { this.keys.clear(); this.mouseDown = false; };
+  private clearInput = () => { this.keys.clear(); this.mouseDown = false; this.mouseRightDown = false; };
   private onBlur = () => {
     this.clearInput();
     if (this.phase === "combat" || this.phase === "countdown") {
@@ -342,14 +496,27 @@ export class Engine {
     if (k === "Digit3") this.equip("rifle");
   };
   private onKeyUp = (e: KeyboardEvent) => this.keys.delete(e.code);
+  private onContextMenu = (e: MouseEvent) => { e.preventDefault(); };
   private onDown = (e: MouseEvent) => {
-    if (e.button !== 0 || !this.simulating || performance.now() < this.resumeBlock) return;
-    this.mouseDown = true; this.triggerUsed = false;
+    if (!this.simulating || performance.now() < this.resumeBlock) return;
+    if (e.button === 0) {
+      this.mouseDown = true; this.triggerUsed = false;
+    } else if (e.button === 2) {
+      this.mouseRightDown = true;
+    }
   };
-  private onUp = () => { this.mouseDown = false; };
+  private onUp = (e?: MouseEvent) => {
+    if (e && e.button !== undefined) {
+      if (e.button === 0) this.mouseDown = false;
+      if (e.button === 2) this.mouseRightDown = false;
+    } else {
+      this.mouseDown = false;
+      this.mouseRightDown = false;
+    }
+  };
   private onMove = (e: MouseEvent) => {
     if (!this.simulating) return;
-    const s = 0.0022 * this.settings.sensitivity;
+    const s = 0.0022 * this.settings.sensitivity * THREE.MathUtils.lerp(1, 0.72, this.ads ?? 0);
     this.yaw -= e.movementX * s;
     this.pitch = Math.max(-1.45, Math.min(1.45, this.pitch - e.movementY * s));
   };
@@ -359,16 +526,34 @@ export class Engine {
     else if (this.phase === "combat" || this.phase === "countdown") { this.resumePhase = this.phase; this.setPhase("paused"); }
   };
   private resize = () => {
-    const w = this.container.clientWidth || 1, h = this.container.clientHeight || 1;
+    const w = this.container.clientWidth || (typeof window !== "undefined" ? window.innerWidth : 800) || 800;
+    const h = this.container.clientHeight || (typeof window !== "undefined" ? window.innerHeight : 600) || 600;
+    const preset = QUALITY_PRESETS[this.settings.quality] || QUALITY_PRESETS.medium;
+    const pr = Math.min((typeof window !== "undefined" ? window.devicePixelRatio : 1) || 1, preset.pixelRatioCap);
+    this.renderer.setPixelRatio(pr);
     this.renderer.setSize(w, h, false);
     this.canvas.style.width = "100%"; this.canvas.style.height = "100%";
     this.camera.aspect = this.vCam.aspect = w / h;
     this.camera.updateProjectionMatrix(); this.vCam.updateProjectionMatrix();
+
+    if (this.composer) {
+      try {
+        this.composer.setSize(w, h);
+        if (this.bloomPass) this.bloomPass.setSize(w, h);
+        if (this.fxaaPass) {
+          const res = this.fxaaPass.material.uniforms["resolution"];
+          if (res && res.value) res.value.set(1 / (w * pr), 1 / (h * pr));
+        }
+      } catch {
+        /* ignore */
+      }
+    }
   };
 
   // ---------- weapons ----------
   private equip(id: WeaponId) {
     if (this.weapon === id && this.views?.[id]?.group.visible) return;
+    this.mouseRightDown = false;
     this.weapon = id; this.reloadT = 0; this.switchT = 0.25; this.cool = Math.max(this.cool, 0.2);
     if (this.views) for (const k of WEAPON_ORDER) this.views[k].group.visible = k === id;
     if (this.store) this.emit();
@@ -376,6 +561,7 @@ export class Engine {
   private startReload() {
     const a = this.ammo[this.weapon], w = WEAPONS[this.weapon];
     if (this.reloadT > 0 || a.mag >= w.mag || a.reserve <= 0) return;
+    this.mouseRightDown = false;
     this.reloadT = w.reload; this.sfx.reload(); this.emit();
   }
   private blocked(a: THREE.Vector3, b: THREE.Vector3) {
@@ -397,7 +583,8 @@ export class Engine {
     this.sfx.shot(this.weapon);
     if (this.targetsDirty) { this.targets = [...this.world.blockers, ...this.zombies.filter((z) => z.state === "alive").flatMap((z) => z.rig.hitMeshes)]; this.targetsDirty = false; }
     const moving = this.hv.length() > 1;
-    const spread = w.spread * (this.keys.has("ShiftLeft") && moving ? 2.2 : moving ? 1.5 : 1) * (this.grounded ? 1 : 2) + this.bloom * 0.0004;
+    const adsSpreadMult = THREE.MathUtils.lerp(1, 0.45, this.ads ?? 0);
+    const spread = (w.spread * (this.keys.has("ShiftLeft") && moving ? 2.2 : moving ? 1.5 : 1) * (this.grounded ? 1 : 2) + this.bloom * 0.0004) * adsSpreadMult;
     const origin = this.camera.getWorldPosition(new THREE.Vector3());
     const hitsByZ = new Map<Zombie, { dmg: number; head: boolean }>();
     for (let p = 0; p < w.pellets; p++) {
@@ -422,7 +609,7 @@ export class Engine {
       this.damageZombie(z, h.dmg, h.head);
     }
     if (hitsByZ.size === 0) this.sfx.impact();
-    this.recoil += w.recoil;
+    this.recoil += w.recoil * THREE.MathUtils.lerp(1, 0.75, this.ads ?? 0);
     this.emit();
   }
   private tracer(a: THREE.Vector3, b: THREE.Vector3) {
@@ -444,11 +631,11 @@ export class Engine {
     if (this.parts.instanceColor) this.parts.instanceColor.needsUpdate = true;
   }
 
-  // ---------- zombies ----------
   private spawn(kind: ZombieKind) {
     const def = ZOMBIES[kind];
-    const pts = this.world.spawnPoints.filter((s) => Math.hypot(s.x - this.pos.x, s.y - this.pos.z) > 24 && this.nav.distAt(s.x, s.y) >= 0 && !circleBlocked(s.x, s.y, def.radius, this.world.colliders, BOUND));
-    const sp = pts[Math.floor(Math.random() * pts.length)];
+    const pts = this.world.spawnPoints.filter((s) => Math.hypot(s.x - this.pos.x, s.y - this.pos.z) > 18 && this.nav.distAt(s.x, s.y) >= 0 && !circleBlocked(s.x, s.y, def.radius, this.world.colliders, this.mapBound));
+    const candidateList = pts.length > 0 ? pts : this.world.spawnPoints.filter((s) => !circleBlocked(s.x, s.y, def.radius, this.world.colliders, this.mapBound));
+    const sp = candidateList[Math.floor(Math.random() * candidateList.length)];
     if (!sp) { this.toSpawn.unshift(kind); return; }
     const rig = buildZombie(this.L, kind, this.renderer.shadowMap.enabled);
     rig.root.scale.setScalar(def.scale);
@@ -528,24 +715,37 @@ export class Engine {
     if (this.simulating) { const n = Math.ceil(dt / 0.02); for (let i = 0; i < n && this.simulating; i++) this.step(dt / n); }
     else if (this.phase === "menu") { this.yaw = Math.sin(now * 0.00008) * 0.5 + 0.2; this.pitch = 0.05; }
     this.visuals(this.simulating ? dt : 0);
-    this.renderer.clear(); this.renderer.render(this.scene, this.camera);
-    this.renderer.clearDepth(); this.renderer.render(this.vScene, this.vCam);
+    if (this.composer && (this.settings.quality === "high" || this.settings.quality === "ultra")) {
+      this.composer.render();
+    } else {
+      this.renderer.clear(); this.renderer.render(this.scene, this.camera);
+      this.renderer.clearDepth(); this.renderer.render(this.vScene, this.vCam);
+    }
   };
 
   private step(dt: number) {
     if (!this.simulating) return;
     // player
-    const sprint = this.keys.has("ShiftLeft") || this.keys.has("ShiftRight");
     let ix = 0, iz = 0;
     if (this.keys.has("KeyW")) iz -= 1; if (this.keys.has("KeyS")) iz += 1; if (this.keys.has("KeyA")) ix -= 1; if (this.keys.has("KeyD")) ix += 1;
     const l = Math.hypot(ix, iz) || 1; ix /= l; iz /= l;
     const s = Math.sin(this.yaw), c = Math.cos(this.yaw);
-    const speed = sprint && iz < 0 ? PLAYER.sprint : PLAYER.walk;
+    const sprint = (this.keys.has("ShiftLeft") || this.keys.has("ShiftRight")) && iz < 0;
+    if (sprint && this.hv.length() > 2) {
+      this.mouseRightDown = false;
+    }
+    const canAds = (this.mouseRightDown ?? false) && this.reloadT <= 0 && this.switchT <= 0 && (!sprint || this.hv.length() <= 2);
+    const adsTarget = canAds ? 1 : 0;
+    this.ads = (this.ads ?? 0) + (adsTarget - (this.ads ?? 0)) * (1 - Math.exp(-18 * dt));
+    if (Math.abs(this.ads - adsTarget) < 0.01) this.ads = adsTarget;
+
+    const adsMult = THREE.MathUtils.lerp(1, 0.65, this.ads ?? 0);
+    const speed = (sprint ? PLAYER.sprint : PLAYER.walk) * adsMult;
     const wx = (ix * c + iz * s) * speed, wz = (-ix * s + iz * c) * speed;
     const k = 1 - Math.exp(-(this.grounded ? 14 : 3) * dt);
     this.hv.x += (wx - this.hv.x) * k; this.hv.y += (wz - this.hv.y) * k;
     this.p2.x = this.pos.x + this.hv.x * dt; this.p2.z = this.pos.z + this.hv.y * dt;
-    resolveCircle(this.p2, PLAYER.radius, this.world.colliders, BOUND);
+    resolveCircle(this.p2, PLAYER.radius, this.world.colliders, this.mapBound);
     this.pos.x = this.p2.x; this.pos.z = this.p2.z;
     if (this.keys.has("Space") && this.grounded) { this.vy = PLAYER.jump; this.grounded = false; }
     this.vy -= PLAYER.gravity * dt; this.pos.y += this.vy * dt;
@@ -599,19 +799,81 @@ export class Engine {
       }
       const dx = px - p.x, dz = pz - p.z, dist = Math.hypot(dx, dz);
       let mx = dx / (dist || 1), mz = dz / (dist || 1);
-      if (dist > 3 && this.nav.dirFrom(p.x, p.z, this.p2)) { mx = this.p2.x; mz = this.p2.z; }
-      let sx = 0, sz = 0;
+
+      // Path navigation: use flow field if distant or direct path to player is obstructed
+      const pathObstructed = dist > 2.8 || this.blocked(this.tmp.set(p.x, 1.2, p.z), this.tmp2.set(px, 1.2, pz));
+      if (pathObstructed && this.nav.dirFrom(p.x, p.z, this.p2)) {
+        mx = this.p2.x;
+        mz = this.p2.z;
+      }
+
+      // Obstacle avoidance feelers (whisker steering around corners & barricades)
+      if (avoidObstacles(p.x, p.z, mx, mz, def.radius, this.world.colliders, this.mapBound, this.avoidP2, 1.6)) {
+        mx = mx * 0.35 + this.avoidP2.x * 0.65;
+        mz = mz * 0.35 + this.avoidP2.z * 0.65;
+        const ml = Math.hypot(mx, mz) || 1;
+        mx /= ml;
+        mz /= ml;
+      }
+
+      // Flocking & Swarm Psychology (Sürü Psikolojisi: Separation, Alignment, Cohesion, Flanking)
+      let sepX = 0, sepZ = 0;
+      let alignX = 0, alignZ = 0;
+      let cohX = 0, cohZ = 0;
+      let neighbors = 0;
+
       for (const o of this.zombies) {
         if (o === z || o.state !== "alive") continue;
-        const ox = p.x - o.rig.root.position.x, oz = p.z - o.rig.root.position.z, d = Math.hypot(ox, oz), min = def.radius + ZOMBIES[o.kind].radius + 0.3;
-        if (d < min && d > 0.001) { sx += (ox / d) * (min - d); sz += (oz / d) * (min - d); }
+        const op = o.rig.root.position;
+        const ox = p.x - op.x, oz = p.z - op.z;
+        const d = Math.hypot(ox, oz);
+        const minSep = def.radius + ZOMBIES[o.kind].radius + 0.45;
+
+        // Separation: repulsion when in personal space
+        if (d < minSep && d > 0.001) {
+          const factor = (minSep - d) / minSep;
+          sepX += (ox / d) * factor;
+          sepZ += (oz / d) * factor;
+        }
+
+        // Swarm cohesion & velocity alignment
+        if (d < 4.5 && d > 0.001) {
+          alignX += o.vx;
+          alignZ += o.vz;
+          cohX += op.x;
+          cohZ += op.z;
+          neighbors++;
+        }
       }
+
+      if (neighbors > 0) {
+        alignX /= neighbors;
+        alignZ /= neighbors;
+        cohX = (cohX / neighbors) - p.x;
+        cohZ = (cohZ / neighbors) - p.z;
+      }
+
+      // Flanking / Encirclement when approaching the player
+      let flankX = 0, flankZ = 0;
+      if (dist < 7 && dist > def.attackRange * def.scale) {
+        const tx = -dz / (dist || 1);
+        const tz = dx / (dist || 1);
+        const side = Math.sin(z.phase * 0.7) > 0 ? 1 : -1;
+        flankX = tx * side * 0.45 * Math.min(1, (7 - dist) / 4);
+        flankZ = tz * side * 0.45 * Math.min(1, (7 - dist) / 4);
+      }
+
       const reach = def.attackRange * def.scale * 0.8;
       const sp = dist < reach ? 0 : z.speed * (z.hitT > 0 ? 0.4 : 1) * (z.fuse >= 0 ? 0.3 : 1);
       const k = 1 - Math.exp(-8 * dt);
-      z.vx += (mx * sp + sx * 3 - z.vx) * k; z.vz += (mz * sp + sz * 3 - z.vz) * k;
+
+      const desiredVx = mx * sp + sepX * 3.8 + alignX * 0.2 + cohX * 0.15 + flankX * sp;
+      const desiredVz = mz * sp + sepZ * 3.8 + alignZ * 0.2 + cohZ * 0.15 + flankZ * sp;
+
+      z.vx += (desiredVx - z.vx) * k;
+      z.vz += (desiredVz - z.vz) * k;
       this.p2.x = p.x + z.vx * dt; this.p2.z = p.z + z.vz * dt;
-      resolveCircle(this.p2, def.radius, this.world.colliders, BOUND);
+      resolveCircle(this.p2, def.radius, this.world.colliders, this.mapBound);
       p.x = this.p2.x; p.z = this.p2.z;
       const target = Math.atan2(dist < 6 ? dx : z.vx, dist < 6 ? dz : z.vz);
       let da = target - r.root.rotation.y; da = Math.atan2(Math.sin(da), Math.cos(da));
@@ -641,10 +903,58 @@ export class Engine {
       if (z.stuckT > 8 && dist > 15) {
         const pts = this.world.spawnPoints.filter((s) => Math.hypot(s.x - px, s.y - pz) > 24);
         const s = pts[Math.floor(Math.random() * pts.length)] ?? this.world.spawnPoints[0];
-        if (s && !circleBlocked(s.x, s.y, def.radius, this.world.colliders, BOUND)) p.set(s.x, 0, s.y);
+        if (s && !circleBlocked(s.x, s.y, def.radius, this.world.colliders, this.mapBound)) p.set(s.x, 0, s.y);
         z.stuckT = 0; z.lastDist = 1e9;
       }
     }
+
+    // Hard circle-circle collision resolution: zombies physically cannot pass through or overlap each other
+    for (let iter = 0; iter < 2; iter++) {
+      for (let i = 0; i < this.zombies.length; i++) {
+        const z1 = this.zombies[i]!;
+        if (z1.state !== "alive") continue;
+        const r1 = ZOMBIES[z1.kind].radius;
+        const p1 = z1.rig.root.position;
+
+        for (let j = i + 1; j < this.zombies.length; j++) {
+          const z2 = this.zombies[j]!;
+          if (z2.state !== "alive") continue;
+          const r2 = ZOMBIES[z2.kind].radius;
+          const p2 = z2.rig.root.position;
+
+          const cx = p2.x - p1.x;
+          const cz = p2.z - p1.z;
+          const minDist = r1 + r2;
+          const d2 = cx * cx + cz * cz;
+
+          if (d2 < minDist * minDist && d2 > 0.000001) {
+            const d = Math.sqrt(d2);
+            const overlap = minDist - d;
+            const nx = cx / d;
+            const nz = cz / d;
+            const w1 = z1.kind === "tank" ? 0.25 : z2.kind === "tank" ? 0.75 : 0.5;
+            const w2 = 1 - w1;
+
+            p1.x -= nx * overlap * w1;
+            p1.z -= nz * overlap * w1;
+            p2.x += nx * overlap * w2;
+            p2.z += nz * overlap * w2;
+          }
+        }
+      }
+    }
+
+    // Re-resolve positions against world colliders in case of push into a wall
+    for (const z of this.zombies) {
+      if (z.state !== "alive") continue;
+      const p = z.rig.root.position;
+      this.p2.x = p.x;
+      this.p2.z = p.z;
+      resolveCircle(this.p2, ZOMBIES[z.kind].radius, this.world.colliders, this.mapBound);
+      p.x = this.p2.x;
+      p.z = this.p2.z;
+    }
+
     // remove sunk corpses
     for (let i = this.zombies.length - 1; i >= 0; i--) { const z = this.zombies[i]; if (z && z.state === "dying" && z.rig.root.position.y < -2.5) { this.scene.remove(z.rig.root); this.zombies.splice(i, 1); } }
     // pickups
@@ -709,22 +1019,73 @@ export class Engine {
     for (const t of this.tracers) { t.t -= dt; t.line.visible = t.t > 0; }
     for (const b of this.booms) { b.t -= dt; b.m.visible = b.t > 0; if (b.t > 0) { b.m.scale.setScalar(EXPLOSION.radius * (1 - b.t / 0.4) + 0.5); } }
     for (const p of this.pickups) { p.obj.rotation.y += dt * 2.5; p.obj.position.y = 0.5 + Math.sin(performance.now() * 0.004 + p.obj.position.x) * 0.12; }
+    // Atmospheric lamp/beacon flicker and pulse
+    if (this.world?.lampLights) {
+      const now = performance.now() * 0.001;
+      for (let i = 0; i < this.world.lampLights.length; i++) {
+        const l = this.world.lampLights[i];
+        if (!l || !l.visible) continue;
+        const base = (l.userData["baseIntensity"] as number | undefined) ?? l.intensity;
+        if (l.userData["pulse"]) {
+          // Warning beacon pulse: slow rhythmic sweep with bright flash
+          const wave = Math.sin(now * 4.5 + i * 1.5);
+          l.intensity = base * (0.35 + Math.max(0, wave) * 0.9);
+        } else {
+          // Industrial fluorescent / sodium lamp subtle flicker & rare micro-glitch
+          const flicker = Math.sin(now * 4 + i * 2.1) * 0.06 + Math.sin(now * 13 + i * 3.7) * 0.04;
+          const drop = (Math.sin(now * 17 + i * 5.3) > 0.97) ? -0.35 : 0;
+          l.intensity = Math.max(0, base * (1 + flicker + drop));
+        }
+      }
+    }
+    if (this.world?.update) {
+      this.world.update(dt, performance.now() * 0.001);
+    }
+
     // camera
     this.recoil *= Math.exp(-10 * dt); this.shake *= Math.exp(-6 * dt); this.dmgFlash *= Math.exp(-2.2 * dt); this.bloom *= Math.exp(-7 * dt);
     this.hitT -= dt; this.headT -= dt; this.flashT -= dt;
-    const bobY = Math.sin(this.bob * 2) * 0.05 * Math.min(1, this.hv.length() / 4);
+    const currentAds = this.ads ?? 0;
+    const targetFov = THREE.MathUtils.lerp(72, 60, currentAds);
+    if (Math.abs(this.camera.fov - targetFov) > 0.05) {
+      this.camera.fov = targetFov;
+      this.camera.updateProjectionMatrix();
+    }
+    const bobFactor = 1 - currentAds * 0.75;
+    const bobY = Math.sin(this.bob * 2) * 0.05 * Math.min(1, this.hv.length() / 4) * bobFactor;
     this.camera.position.set(this.pos.x + (Math.random() - 0.5) * this.shake * 0.2, this.pos.y + PLAYER.eye + bobY + (Math.random() - 0.5) * this.shake * 0.2, this.pos.z);
     this.camera.rotation.set(this.pitch + this.recoil, this.yaw, 0);
     this.muzzleLight.intensity = this.flashT > 0 ? 6 : 0;
     // viewmodel
     const vm = this.views[this.weapon];
     const rel = this.reloadT > 0 ? Math.sin((1 - this.reloadT / WEAPONS[this.weapon].reload) * Math.PI) : 0;
-    vm.group.position.set(0.24 + Math.sin(this.bob) * 0.012, -0.24 + Math.abs(Math.cos(this.bob)) * 0.01 - this.switchT * 0.8 - rel * 0.06, -0.5 + this.recoil * 2.5);
-    vm.group.rotation.set(this.recoil * 4 - rel * 0.5, 0.02, rel * 0.6);
+    const adsOffset = ADS_OFFSETS[this.weapon];
+
+    const hipX = 0.24 + Math.sin(this.bob) * 0.012 * bobFactor;
+    const hipY = -0.24 + Math.abs(Math.cos(this.bob)) * 0.01 * bobFactor - this.switchT * 0.8 - rel * 0.06;
+    const hipZ = -0.5 + this.recoil * 2.5;
+
+    const targetX = adsOffset.x + Math.sin(this.bob) * 0.003 * bobFactor;
+    const targetY = adsOffset.y + Math.abs(Math.cos(this.bob)) * 0.003 * bobFactor - this.switchT * 0.8 - rel * 0.06;
+    const targetZ = adsOffset.z + this.recoil * 1.4;
+
+    const posX = THREE.MathUtils.lerp(hipX, targetX, currentAds);
+    const posY = THREE.MathUtils.lerp(hipY, targetY, currentAds);
+    const posZ = THREE.MathUtils.lerp(hipZ, targetZ, currentAds);
+    vm.group.position.set(posX, posY, posZ);
+
+    const rotX = (this.recoil * (4 - currentAds * 1.5)) - rel * 0.5;
+    const rotY = 0.02 * (1 - currentAds);
+    const rotZ = rel * 0.6;
+    vm.group.rotation.set(rotX, rotY, rotZ);
+
     const fl = vm.muzzle.getObjectByName("flash"); if (fl) { fl.visible = this.flashT > 0; fl.rotation.z = Math.random() * 3; }
     // DOM effects
     const gap = 8 + this.bloom * 0.6 + Math.min(10, this.hv.length() * 1.2);
     this.els.cross?.style.setProperty("--gap", `${gap}px`);
+    if (this.els.cross) {
+      this.els.cross.style.opacity = String(Math.max(0, 1 - currentAds * 1.6));
+    }
     if (this.els.hit) { this.els.hit.style.opacity = String(Math.max(0, this.hitT) * 7); this.els.hit.dataset["head"] = this.headT > 0 ? "1" : "0"; }
     if (this.els.vig) this.els.vig.style.opacity = String(Math.min(1, this.dmgFlash + (this.hp < 30 && this.phase === "combat" ? 0.35 : 0)));
   }
@@ -739,10 +1100,13 @@ export class Engine {
     window.removeEventListener("keyup", this.onKeyUp);
     window.removeEventListener("blur", this.onBlur);
     window.removeEventListener("mouseup", this.onUp);
+    window.removeEventListener("contextmenu", this.onContextMenu);
     document.removeEventListener("mousemove", this.onMove);
     document.removeEventListener("pointerlockchange", this.onLock);
     this.canvas.removeEventListener("mousedown", this.onDown);
+    this.canvas.removeEventListener("contextmenu", this.onContextMenu);
     if (document.pointerLockElement) document.exitPointerLock();
+    this.disposePostProcessing();
     this.world.dispose(); this.L.dispose(); this.sfx.dispose();
     (this.parts.material as THREE.Material).dispose();
     this.tracers.forEach((t) => { t.line.geometry.dispose(); (t.line.material as THREE.Material).dispose(); });

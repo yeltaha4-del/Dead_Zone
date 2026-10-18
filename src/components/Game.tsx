@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { Engine, type BuyItem } from "@/game/engine";
 import { HudStore } from "@/game/store";
-import { LIMITS, PLAYER, PRICES, WEAPONS, WEAPON_ORDER, damageUpgradePrice } from "@/game/config";
+import { LIMITS, MAPS, MAP_ORDER, PLAYER, PRICES, WEAPONS, WEAPON_ORDER, damageUpgradePrice, type MapId } from "@/game/config";
 
 const dummy = new HudStore({} as never);
 
@@ -45,6 +45,7 @@ export function Game() {
           <div className="absolute left-1/2 top-5 -translate-x-1/2 text-center">
             <div className="dz-title text-5xl leading-none">DALGA {s.wave}</div>
             <div className="mt-1 text-xl tracking-widest text-foreground">KALAN ZOMBİ: {s.remaining}</div>
+            <div className="mt-0.5 text-xs font-bold tracking-[0.25em] text-primary/80 uppercase">{MAPS[s.map]?.name}</div>
           </div>
           <div className="absolute right-6 top-5 text-right">
             <div className="text-3xl font-bold text-gold">ALTIN: {s.gold.toLocaleString("tr-TR")}</div>
@@ -71,14 +72,15 @@ export function Game() {
           <div className="absolute bottom-32 left-1/2 -translate-x-1/2 space-y-1 text-center">
             {s.notices.map((n) => <div key={n.id} className={`dz-notice ${n.tone === "gold" ? "text-gold" : "text-foreground"}`}>{n.text}</div>)}
           </div>
-          {inGame && s.wave === 1 && <div className="dz-fade absolute bottom-6 left-1/2 -translate-x-1/2 text-xs tracking-widest text-muted-foreground">WASD HAREKET · SHIFT KOŞ · SPACE ZIPLA · R DOLDUR · 1/2/3 SİLAH · F FENER · B MARKET · ESC DURAKLAT</div>}
+          {inGame && s.wave === 1 && <div className="dz-fade absolute bottom-6 left-1/2 -translate-x-1/2 text-xs tracking-widest text-muted-foreground">WASD HAREKET · SAĞ TIK NİŞAN · SHIFT KOŞ · SPACE ZIPLA · R DOLDUR · 1/2/3 SİLAH · F FENER · B MARKET · ESC DURAKLAT</div>}
         </div>
       )}
       {!ready && <Center><div className="dz-title text-4xl">YÜKLENİYOR…</div></Center>}
-      {ready && s.phase === "menu" && <Menu e={engine!} best={s.best} touch={touch} settings={s.settings} />}
+      {ready && s.phase === "menu" && <Menu e={engine!} best={s.best} touch={touch} settings={s.settings} currentMap={s.map} />}
       {ready && s.phase === "paused" && (
         <Overlay>
           <h2 className="dz-title text-5xl">DURAKLATILDI</h2>
+          <div className="mt-1 text-xs tracking-[0.3em] font-bold text-gold uppercase">{MAPS[s.map]?.name}</div>
           {s.lockFallback && <p className="mt-4 max-w-sm text-center text-muted-foreground">Fare kilidi alınamadı. Oyunu ayrı sekmede açıp Devam Et düğmesine tıklayın.</p>}
           <button autoFocus className="dz-btn mt-6" onClick={() => engine!.resume()}>DEVAM ET</button>
           <button className="dz-btn-ghost mt-3" onClick={() => engine!.toMenu()}>ANA MENÜ</button>
@@ -89,11 +91,12 @@ export function Game() {
       {ready && s.phase === "gameover" && (
         <Overlay>
           <h2 className="dz-title text-6xl">ÖLDÜN</h2>
+          <div className="mt-1 text-xs tracking-[0.3em] font-bold text-gold uppercase">{MAPS[s.map]?.name}</div>
           <div className="mt-4 grid grid-cols-3 gap-6 text-center">
             <Stat k="DALGA" v={s.wave} /><Stat k="SKOR" v={s.score} /><Stat k="LEŞ" v={s.kills} />
           </div>
           <p className="mt-3 text-sm text-muted-foreground">En iyi: Dalga {s.best.wave} · Skor {s.best.score} · Kafadan vuruş {s.headshots}</p>
-          <button autoFocus className="dz-btn mt-6" onClick={() => engine!.start()}>TEKRAR OYNA</button>
+          <button autoFocus className="dz-btn mt-6" onClick={() => engine!.start(s.map)}>TEKRAR OYNA</button>
           <button className="dz-btn-ghost mt-3" onClick={() => engine!.toMenu()}>ANA MENÜ</button>
         </Overlay>
       )}
@@ -119,27 +122,69 @@ function Bar({ label, v, max, tone }: { label: string; v: number; max: number; t
   );
 }
 
-function Menu({ e, best, touch, settings }: { e: Engine; best: { wave: number; score: number }; touch: boolean; settings: import("@/game/store").Settings }) {
+function Menu({ e, best, touch, settings, currentMap }: { e: Engine; best: { wave: number; score: number }; touch: boolean; settings: import("@/game/store").Settings; currentMap: MapId }) {
   const [open, setOpen] = useState(false);
   return (
-    <div className="absolute inset-0 flex flex-col justify-center bg-menu px-[8vw]">
+    <div className="absolute inset-0 flex flex-col justify-center bg-menu px-[8vw] py-8 overflow-y-auto">
       <div className="text-sm tracking-[0.6em] text-primary">OUTBREAK</div>
-      <h1 className="dz-title text-[clamp(4rem,10vw,9rem)] leading-[0.85]">DEAD ZONE</h1>
-      <div className="mt-1 text-lg tracking-[0.4em] text-muted-foreground">3D · HAYATTA KALMA</div>
+      <h1 className="dz-title text-[clamp(3.5rem,8.5vw,7.5rem)] leading-[0.85]">DEAD ZONE</h1>
+      <div className="mt-1 text-base tracking-[0.4em] text-muted-foreground">3D · HAYATTA KALMA</div>
       {touch ? (
         <p className="mt-8 max-w-md border-l-2 border-primary pl-4 text-foreground">Bu oyun klavye ve fare gerektirir. Lütfen bir masaüstü bilgisayardan açın.</p>
       ) : (
         <>
-          <div className="mt-8 flex gap-3">
-            <button autoFocus className="dz-btn" onClick={() => e.start()}>OYUNA BAŞLA</button>
+          {/* Harita Seçimi Kartları */}
+          <div className="mt-6 max-w-xl">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold tracking-[0.25em] text-muted-foreground uppercase">Harita Seçimi</span>
+              <span className="text-xs text-primary font-bold tracking-widest">{MAPS[currentMap]?.name}</span>
+            </div>
+            <div className="mt-2.5 grid grid-cols-1 sm:grid-cols-2 gap-3">
+              {MAP_ORDER.map((id) => {
+                const m = MAPS[id];
+                const selected = currentMap === id;
+                return (
+                  <button
+                    key={id}
+                    type="button"
+                    onClick={() => e.selectMap(id)}
+                    className={`group relative text-left p-3.5 transition-all border cursor-pointer ${
+                      selected
+                        ? "bg-card/95 border-primary shadow-[0_0_18px_rgba(230,50,40,0.35)]"
+                        : "bg-card/45 border-border hover:border-primary/50 hover:bg-card/75"
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <span className={`font-bold text-base tracking-wide transition-colors ${selected ? "text-primary" : "text-foreground group-hover:text-primary"}`}>
+                        {m.name}
+                      </span>
+                      <span className={`text-[0.65rem] tracking-wider px-1.5 py-0.5 font-bold uppercase shrink-0 ${
+                        selected ? "bg-primary text-primary-foreground" : "bg-muted text-muted-foreground"
+                      }`}>
+                        {selected ? "SEÇİLİ" : m.difficulty}
+                      </span>
+                    </div>
+                    <div className="text-xs text-gold font-medium tracking-wide mt-1">{m.tagline}</div>
+                    <div className="text-xs text-muted-foreground mt-1.5 line-clamp-2 leading-relaxed">{m.desc}</div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="mt-6 flex gap-3">
+            <button autoFocus className="dz-btn" onClick={() => e.start(currentMap)}>OYUNA BAŞLA</button>
             <button className="dz-btn-ghost" onClick={() => setOpen((o) => !o)} aria-expanded={open}>AYARLAR</button>
           </div>
           {open && <div className="mt-4 max-w-sm"><Settings e={e} st={settings} /></div>}
-          <div className="mt-8 grid max-w-md grid-cols-2 gap-x-6 gap-y-1 text-sm text-muted-foreground">
-            <span>WASD — hareket</span><span>Fare — nişan / ateş</span><span>Shift — koş</span><span>Space — zıpla</span>
-            <span>R — doldur</span><span>1 / 2 / 3 — silah</span><span>F — fener</span><span>B / P — market</span>
+          <div className="mt-6 grid max-w-md grid-cols-2 gap-x-6 gap-y-1 text-sm text-muted-foreground">
+            <span>WASD — hareket</span><span>Sol tık — ateş</span>
+            <span>Sağ tık — nişan al</span><span>Shift — koş</span>
+            <span>Space — zıpla</span><span>R — doldur</span>
+            <span>1 / 2 / 3 — silah</span><span>F — fener</span>
+            <span>B / P — market</span><span>ESC — duraklat</span>
           </div>
-          {best.wave > 0 && <div className="mt-6 text-sm tracking-widest text-gold">EN İYİ: DALGA {best.wave} · {best.score} PUAN</div>}
+          {best.wave > 0 && <div className="mt-4 text-sm tracking-widest text-gold">EN İYİ: DALGA {best.wave} · {best.score} PUAN</div>}
         </>
       )}
     </div>
@@ -156,8 +201,11 @@ function Settings({ e, st }: { e: Engine; st: import("@/game/store").Settings })
         <input type="checkbox" checked={st.sound} onChange={(x) => e.updateSettings({ sound: x.target.checked })} className="accent-primary" />
       </label>
       <label className="flex items-center justify-between">Grafik kalitesi
-        <select value={st.quality} onChange={(x) => e.updateSettings({ quality: x.target.value as "low" | "medium" })} className="bg-card px-2 py-1">
-          <option value="medium">Orta</option><option value="low">Düşük</option>
+        <select value={st.quality} onChange={(x) => e.updateSettings({ quality: x.target.value as import("@/game/config").Quality })} className="bg-card border border-border px-2.5 py-1 text-foreground font-semibold rounded cursor-pointer">
+          <option value="low">Düşük</option>
+          <option value="medium">Orta</option>
+          <option value="high">Yüksek</option>
+          <option value="ultra">Ultra</option>
         </select>
       </label>
     </div>

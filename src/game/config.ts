@@ -1,7 +1,130 @@
 export type WeaponId = "pistol" | "shotgun" | "rifle";
 export type ZombieKind = "walker" | "runner" | "tank" | "exploder";
-export type Quality = "low" | "medium";
+export type Quality = "low" | "medium" | "high" | "ultra";
 export type Phase = "menu" | "countdown" | "combat" | "paused" | "market" | "gameover";
+export type MapId = "city" | "factory";
+
+export interface QualityPreset {
+  id: Quality;
+  name: string;
+  shadows: boolean;
+  shadowMapSize: number;
+  pixelRatioCap: number;
+  texResolution: number;
+  postProcessing: boolean;
+  bloom: boolean;
+  bloomStrength: number;
+  bloomRadius: number;
+  bloomThreshold: number;
+  fxaa: boolean;
+  wetReflections: "basic" | "planar" | "enhanced";
+  particles: number;
+  puddleRoughness: number;
+}
+
+export const QUALITY_PRESETS: Record<Quality, QualityPreset> = {
+  low: {
+    id: "low",
+    name: "Düşük",
+    shadows: false,
+    shadowMapSize: 1024,
+    pixelRatioCap: 1.0,
+    texResolution: 256,
+    postProcessing: false,
+    bloom: false,
+    bloomStrength: 0,
+    bloomRadius: 0,
+    bloomThreshold: 1,
+    fxaa: false,
+    wetReflections: "basic",
+    particles: 60,
+    puddleRoughness: 0.35,
+  },
+  medium: {
+    id: "medium",
+    name: "Orta",
+    shadows: true,
+    shadowMapSize: 1024,
+    pixelRatioCap: 1.25,
+    texResolution: 512,
+    postProcessing: false,
+    bloom: false,
+    bloomStrength: 0,
+    bloomRadius: 0,
+    bloomThreshold: 1,
+    fxaa: false,
+    wetReflections: "basic",
+    particles: 120,
+    puddleRoughness: 0.18,
+  },
+  high: {
+    id: "high",
+    name: "Yüksek",
+    shadows: true,
+    shadowMapSize: 2048,
+    pixelRatioCap: 1.5,
+    texResolution: 1024,
+    postProcessing: true,
+    bloom: false,
+    bloomStrength: 0,
+    bloomRadius: 0,
+    bloomThreshold: 1.0,
+    fxaa: true,
+    wetReflections: "planar",
+    particles: 180,
+    puddleRoughness: 0.08,
+  },
+  ultra: {
+    id: "ultra",
+    name: "Ultra",
+    shadows: true,
+    shadowMapSize: 4096,
+    pixelRatioCap: 2.0,
+    texResolution: 2048,
+    postProcessing: true,
+    bloom: false,
+    bloomStrength: 0,
+    bloomRadius: 0,
+    bloomThreshold: 1.0,
+    fxaa: true,
+    wetReflections: "enhanced",
+    particles: 240,
+    puddleRoughness: 0.03,
+  },
+};
+
+export interface MapDef {
+  id: MapId;
+  name: string;
+  tagline: string;
+  desc: string;
+  difficulty: string;
+  fogColor: string;
+  fogDensity: number;
+}
+
+export const MAPS: Record<MapId, MapDef> = {
+  city: {
+    id: "city",
+    name: "Ölümcül Şehir",
+    tagline: "Karanlık Sokaklar",
+    desc: "Terk edilmiş gökdelenler, kavşaklar ve sokak barikatları ile dolu kentsel hayatta kalma alanı.",
+    difficulty: "Dengeli",
+    fogColor: "#2b3546",
+    fogDensity: 0.024,
+  },
+  factory: {
+    id: "factory",
+    name: "Terk Edilmiş Fabrika",
+    tagline: "Endüstriyel Harabe",
+    desc: "Merkezi avlu, iki büyük üretim salonu, kargo deposu, boru hatları ve dar kaçış dehlizleri.",
+    difficulty: "Taktiksel",
+    fogColor: "#1a2028",
+    fogDensity: 0.026,
+  },
+};
+
+export const MAP_ORDER: MapId[] = ["city", "factory"];
 
 export interface WeaponDef {
   id: WeaponId;

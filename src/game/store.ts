@@ -1,4 +1,4 @@
-import type { Phase, Quality, WeaponId } from "./config";
+import type { MapId, Phase, Quality, WeaponId } from "./config";
 
 export interface Settings {
   sensitivity: number;
@@ -36,6 +36,7 @@ export interface HudState {
   best: { wave: number; score: number };
   settings: Settings;
   lockFallback: boolean;
+  map: MapId;
 }
 
 const KEY = "deadzone3d.v1";
@@ -46,12 +47,14 @@ export function loadSaved(): { best: { wave: number; score: number }; settings: 
     const raw = window.localStorage.getItem(KEY);
     if (!raw) return def;
     const p = JSON.parse(raw);
+    const rawQuality = p?.settings?.quality;
+    const validQuality: Quality = (rawQuality === "low" || rawQuality === "medium" || rawQuality === "high" || rawQuality === "ultra") ? rawQuality : "medium";
     return {
       best: { wave: Number(p?.best?.wave) || 0, score: Number(p?.best?.score) || 0 },
       settings: {
         sensitivity: Math.min(3, Math.max(0.2, Number(p?.settings?.sensitivity) || 1)),
         sound: p?.settings?.sound !== false,
-        quality: p?.settings?.quality === "low" ? "low" : "medium",
+        quality: validQuality,
       },
     };
   } catch {
